@@ -1,0 +1,21 @@
+# Dependências do painel Saúde da Base de Turmas (SaudedaBase)
+# Instalar com: pip install -r requirements.txt
+
+# Interface e gráficos (app_turma.py, app_turma_hud.py)
+streamlit>=1.37
+plotly>=5.24
+
+# Processamento de dados (processar.py e apps)
+pandas>=2.0
+polars>=1.0
+pyarrow>=14.0
+
+# Biblioteca INTERNA da SEDU (processar.py: "from pygei.seges import turmas").
+# Não está no PyPI. Instale pelo canal interno e mantenha comentada aqui,
+# senão o "pip install -r" falha fora da rede da SEDU.
+# pygei
+
+# Só se o módulo validacoes/professores_excedentes gerar .xlsx (exportar_excel).
+# Descomente conforme o que ele usar:
+# xlsxwriter
+# openpyxl
