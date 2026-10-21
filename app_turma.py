@@ -445,6 +445,313 @@ def _fig_regional(df_reg):
 _CFG = {"displayModeBar": False}
 
 
+# ── Insights da série histórica (versão GitHub: só agregados, sem escola/CPF) ──
+LIMIAR_VARIACAO = 0.10        # |variação diária| acima disso vira alerta de "conferir a base"
+LIMIAR_ESTAGNADA = -0.10      # regional que caiu menos que 10% no período = estagnada
+MIN_DATAS_PREVISAO = 15       # previsão de burn-down só aparece com histórico suficiente
+JANELA_PREVISAO = 5           # nº de últimos intervalos usados no ritmo de resolução
+
+
+def _pct(v, sinal=True):
+    s = f"{v * 100:+.1f}%" if sinal else f"{v * 100:.1f}%"
+    return s.replace(".", ",")
+
+
+def _fmt_dia(d):
+    return pd.Timestamp(d).strftime("%d/%m")
+
+
+@st.cache_data(ttl=300)
+def _carregar_insights(filtrar: bool = False):
+    """
+    Calcula, a partir do resumo.parquet COMPLETO (todas as dt_referencia), as séries dos insights.
+    Unidade: chave = id_turma|disciplina|cpf_docente (só eh_excedente == 1). Retorna {} se faltar dado
+    (ou se houver menos de 2 datas). Só agregados saem daqui: nenhum CPF/escola é devolvido.
+    """
+    caminho = _RESULTADOS / "resumo.parquet"
+    if not caminho.exists():
+        return {}
+    df = pd.read_parquet(caminho)
+    df.columns = df.columns.str.strip()
+    precisa = (DT_COL, "eh_excedente", "id_turma", "disciplina", "cpf_docente")
+    if any(c not in df.columns for c in precisa):
+        return {}
+    if "script" in df.columns and (df["script"] == "professores_excedentes").any():
+        df = df[df["script"] == "professores_excedentes"]
+    if filtrar:
+        df = _aplicar_filtros(df)
+
+    df = df.copy()
+    df[DT_COL] = pd.to_datetime(df[DT_COL], errors="coerce").dt.normalize()
+    df = df.dropna(subset=[DT_COL])
+    datas = sorted(df[DT_COL].unique())
+    if len(datas) < 2:
+        return {}
+
+    ex = df[pd.to_numeric(df["eh_excedente"], errors="coerce").fillna(0) == 1].copy()
+    ex["chave"] = (ex["id_turma"].astype(str) + "|" + ex["disciplina"].astype(str)
+                   + "|" + ex["cpf_docente"].astype(str))
+    chaves = {d: set(g["chave"]) for d, g in ex.groupby(DT_COL)}
+    sets = [chaves.get(d, set()) for d in datas]
+
+    # 1 + 8) fluxo diário e variação
+    linhas = []
+    for i, d in enumerate(datas):
+        est = len(sets[i])
+        if i == 0:
+            linhas.append(dict(data=d, estoque=est, resolvidos=None, novos=None, var_pct=None, igual=False))
+            continue
+        res, nov = len(sets[i - 1] - sets[i]), len(sets[i] - sets[i - 1])
+        ant = len(sets[i - 1])
+        linhas.append(dict(data=d, estoque=est, resolvidos=res, novos=nov,
+                           var_pct=(est - ant) / ant if ant else None, igual=(res == 0 and nov == 0)))
+    fluxo = pd.DataFrame(linhas)
+
+    # 2) coorte da primeira data
+    base = sets[0]
+    coorte = pd.DataFrame({
+        "data": datas,
+        "restantes": [len(base & s) for s in sets],
+    })
+    coorte["pct"] = coorte["restantes"] / len(base) if base else 0.0
+    coorte.attrs["base"] = len(base)
+
+    # 3) regionais (primeira × última data)
+    regional = pd.DataFrame(columns=["regional", "inicio", "fim", "var_pct"])
+    if "nm_regional" in ex.columns:
+        ini = ex[ex[DT_COL] == datas[0]].groupby("nm_regional")["chave"].nunique()
+        fim = ex[ex[DT_COL] == datas[-1]].groupby("nm_regional")["chave"].nunique()
+        regional = pd.concat([ini.rename("inicio"), fim.rename("fim")], axis=1).fillna(0).astype(int)
+        regional = regional[regional["inicio"] > 0].reset_index().rename(columns={"nm_regional": "regional"})
+        regional["var_pct"] = (regional["fim"] - regional["inicio"]) / regional["inicio"]
+        regional = regional.sort_values("var_pct").reset_index(drop=True)
+
+    # 5) reincidência (saiu e voltou)
+    visto, saiu, voltou, linhas = set(), set(), set(), []
+    for d, s in zip(datas, sets):
+        voltou |= (s & saiu)
+        saiu = (saiu | (visto - s)) - s
+        visto |= s
+        ativos = len(s & voltou)
+        linhas.append(dict(data=d, reinc_ativos=ativos, pct=(ativos / len(s)) if s else 0.0,
+                           acumulado=len(voltou)))
+    reinc = pd.DataFrame(linhas)
+    reinc.attrs["total_chaves"] = len(visto)
+
+    # 7a) disciplinas: variação desde a primeira data (top 10 do início)
+    g_ini = ex[ex[DT_COL] == datas[0]].groupby("disciplina")["chave"].nunique()
+    g_fim = ex[ex[DT_COL] == datas[-1]].groupby("disciplina")["chave"].nunique()
+    disc = pd.concat([g_ini.rename("inicio"), g_fim.rename("fim")], axis=1).fillna(0).astype(int)
+    disc = disc[disc["inicio"] > 0].nlargest(10, "inicio").reset_index().rename(columns={"index": "disciplina"})
+    if "disciplina" not in disc.columns:
+        disc = disc.rename(columns={disc.columns[0]: "disciplina"})
+    disc["var_pct"] = (disc["fim"] - disc["inicio"]) / disc["inicio"]
+    disc = disc.sort_values("var_pct").reset_index(drop=True)
+
+    # 7b) vínculo funcional ao longo do tempo (participação %)
+    vinculo = pd.DataFrame(columns=["data", "vinculo", "qtd", "pct"])
+    if "dc_situacao_funcional" in ex.columns:
+        v = ex.assign(vinculo=ex["dc_situacao_funcional"].fillna("Não informado").astype(str))
+        top = v["vinculo"].value_counts().index[:5]
+        v["vinculo"] = v["vinculo"].where(v["vinculo"].isin(top), "Outros")
+        vinculo = v.groupby([DT_COL, "vinculo"])["chave"].nunique().reset_index(name="qtd")
+        vinculo = vinculo.rename(columns={DT_COL: "data"})
+        vinculo["pct"] = vinculo["qtd"] / vinculo.groupby("data")["qtd"].transform("sum")
+
+    return dict(datas=datas, fluxo=fluxo, coorte=coorte, regional=regional,
+                reinc=reinc, disc=disc, vinculo=vinculo)
+
+
+def _layout_base(altura, **extra):
+    lay = dict(
+        height=altura, margin=dict(l=10, r=20, t=10, b=10),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="sans-serif", size=12, color=MUTED),
+        xaxis=dict(type="category", showgrid=False, tickfont=dict(color=TEXT, size=12)),
+        yaxis=dict(gridcolor="#f0f4f5", zeroline=False, tickfont=dict(color=TEXT, size=12)),
+        showlegend=False,
+    )
+    lay.update(extra)
+    return lay
+
+
+def _fig_fluxo(ins):
+    f = ins["fluxo"].dropna(subset=["resolvidos"])
+    xs = f["data"].map(_fmt_dia)
+    saldo = f["novos"] - f["resolvidos"]
+    fig = go.Figure()
+    fig.add_bar(x=xs, y=-f["resolvidos"], name="Resolvidos", marker_color=PRIO_LOW,
+                text=[fmt(int(v)) for v in f["resolvidos"]], textposition="outside",
+                customdata=f["resolvidos"], hovertemplate="<b>%{x}</b><br>%{customdata:,} resolvidos<extra></extra>")
+    fig.add_bar(x=xs, y=f["novos"], name="Novos", marker_color=PRIO_HIGH,
+                text=[fmt(int(v)) for v in f["novos"]], textposition="outside",
+                hovertemplate="<b>%{x}</b><br>%{y:,} novos<extra></extra>")
+    fig.add_scatter(x=xs, y=saldo, name="Saldo", mode="lines+markers",
+                    line=dict(color=TEXT, width=2), marker=dict(size=7),
+                    hovertemplate="<b>%{x}</b><br>saldo %{y:+,}<extra></extra>")
+    lim = float(max(f["resolvidos"].max(), f["novos"].max(), 1)) * 1.25
+    fig.update_layout(**_layout_base(
+        300, barmode="relative", showlegend=True,
+        legend=dict(orientation="h", y=1.12, x=0),
+        yaxis=dict(gridcolor="#f0f4f5", zeroline=True, zerolinecolor="#cbd5e0",
+                   range=[-lim, lim], tickfont=dict(color=TEXT, size=12))))
+    return fig
+
+
+def _fig_variacao(ins):
+    f = ins["fluxo"].dropna(subset=["var_pct"])
+    xs = f["data"].map(_fmt_dia)
+    cores = [MUTED if ig else (PRIO_HIGH if abs(v) > LIMIAR_VARIACAO else TEAL)
+             for v, ig in zip(f["var_pct"], f["igual"])]
+    textos = ["base igual" if ig else _pct(v) for v, ig in zip(f["var_pct"], f["igual"])]
+    fig = go.Figure(go.Bar(x=xs, y=f["var_pct"], marker_color=cores, text=textos,
+                           textposition="outside", textfont=dict(size=12, color=TEXT),
+                           hovertemplate="<b>%{x}</b><br>%{y:+.1%} vs. data anterior<extra></extra>"))
+    for lim in (LIMIAR_VARIACAO, -LIMIAR_VARIACAO):
+        fig.add_hline(y=lim, line=dict(color=PRIO_HIGH, width=1, dash="dot"))
+    m = max(float(f["var_pct"].abs().max()), LIMIAR_VARIACAO) * 1.35
+    fig.update_layout(**_layout_base(
+        300, yaxis=dict(gridcolor="#f0f4f5", zeroline=True, zerolinecolor="#cbd5e0",
+                        range=[-m, m], tickformat=".0%", tickfont=dict(color=TEXT, size=12))))
+    return fig
+
+
+def _fig_coorte(ins):
+    c = ins["coorte"]
+    cor = TEAL
+    fig = go.Figure(go.Scatter(
+        x=c["data"].map(_fmt_dia), y=c["pct"], mode="lines+markers+text",
+        line=dict(color=cor, width=3), marker=dict(size=9, color=cor),
+        text=[_pct(v, sinal=False) for v in c["pct"]], textposition="top center",
+        textfont=dict(size=12, color=cor), customdata=c["restantes"],
+        hovertemplate="<b>%{x}</b><br>%{y:.1%} da coorte inicial (%{customdata:,} chaves)<extra></extra>"))
+    fig.update_layout(**_layout_base(
+        300, yaxis=dict(gridcolor="#f0f4f5", zeroline=False, range=[0, 1.15],
+                        tickformat=".0%", tickfont=dict(color=TEXT, size=12))))
+    return fig
+
+
+def _fig_regional_var(ins):
+    r = ins["regional"]
+    if r.empty:
+        return None
+    cores = [PRIO_HIGH if v > LIMIAR_ESTAGNADA else PRIO_LOW for v in r["var_pct"]]
+    fig = go.Figure(go.Bar(
+        x=r["var_pct"], y=r["regional"], orientation="h", marker=dict(color=cores, cornerradius=4),
+        text=[f"{_pct(v)}  ({fmt(int(a))}→{fmt(int(b))})" for v, a, b in zip(r["var_pct"], r["inicio"], r["fim"])],
+        textposition="outside", textfont=dict(size=11, color=TEXT),
+        hovertemplate="<b>%{y}</b><br>%{x:+.1%}<extra></extra>"))
+    lo, hi = float(r["var_pct"].min()), float(r["var_pct"].max())
+    fig.update_layout(**_layout_base(
+        max(220, 34 * len(r) + 40), margin=dict(l=0, r=130, t=10, b=10),
+        xaxis=dict(gridcolor="#f0f4f5", zeroline=True, zerolinecolor="#cbd5e0", tickformat=".0%",
+                   range=[min(lo, -0.05) * 1.1, max(hi, 0.05) * 1.1 + 0.05], tickfont=dict(color=TEXT, size=12)),
+        yaxis=dict(autorange="reversed", showgrid=False, tickfont=dict(color=TEXT, size=12))))
+    return fig
+
+
+def _fig_reinc(ins):
+    r = ins["reinc"]
+    fig = go.Figure(go.Bar(
+        x=r["data"].map(_fmt_dia), y=r["reinc_ativos"], marker_color=YELLOW_DARK,
+        text=[f"{fmt(int(a))}<br>{_pct(p, sinal=False)}" for a, p in zip(r["reinc_ativos"], r["pct"])],
+        textposition="outside", textfont=dict(size=11, color=TEXT), customdata=r["pct"],
+        hovertemplate="<b>%{x}</b><br>%{y:,} reincidentes no estoque (%{customdata:.1%})<extra></extra>"))
+    m = float(max(r["reinc_ativos"].max(), 1)) * 1.3
+    fig.update_layout(**_layout_base(300, yaxis=dict(gridcolor="#f0f4f5", zeroline=False, range=[0, m],
+                                                    tickfont=dict(color=TEXT, size=12))))
+    return fig
+
+
+def _fig_disc_var(ins):
+    d = ins["disc"]
+    if d.empty:
+        return None
+    cores = [PRIO_HIGH if v > LIMIAR_ESTAGNADA else PRIO_LOW for v in d["var_pct"]]
+    fig = go.Figure(go.Bar(
+        x=d["var_pct"], y=d["disciplina"], orientation="h", marker=dict(color=cores, cornerradius=4),
+        text=[f"{_pct(v)}  ({fmt(int(a))}→{fmt(int(b))})" for v, a, b in zip(d["var_pct"], d["inicio"], d["fim"])],
+        textposition="outside", textfont=dict(size=11, color=TEXT),
+        hovertemplate="<b>%{y}</b><br>%{x:+.1%}<extra></extra>"))
+    lo, hi = float(d["var_pct"].min()), float(d["var_pct"].max())
+    fig.update_layout(**_layout_base(
+        max(220, 36 * len(d) + 40), margin=dict(l=0, r=130, t=10, b=10),
+        xaxis=dict(gridcolor="#f0f4f5", zeroline=True, zerolinecolor="#cbd5e0", tickformat=".0%",
+                   range=[min(lo, -0.05) * 1.1, max(hi, 0.05) * 1.1 + 0.05], tickfont=dict(color=TEXT, size=12)),
+        yaxis=dict(autorange="reversed", showgrid=False, tickfont=dict(color=TEXT, size=12))))
+    return fig
+
+
+def _fig_vinculo(ins):
+    v = ins["vinculo"]
+    if v.empty:
+        return None
+    paleta = [TEAL, PRIO_HIGH, YELLOW, PRIO_LOW, TEAL_DARK, MUTED]
+    fig = go.Figure()
+    for i, nome in enumerate(sorted(v["vinculo"].unique())):
+        s = v[v["vinculo"] == nome].sort_values("data")
+        fig.add_bar(x=s["data"].map(_fmt_dia), y=s["pct"], name=nome, marker_color=paleta[i % len(paleta)],
+                    customdata=s["qtd"],
+                    hovertemplate=f"<b>%{{x}}</b><br>{nome}: %{{y:.1%}} (%{{customdata:,}})<extra></extra>")
+    fig.update_layout(**_layout_base(
+        300, barmode="stack", showlegend=True, legend=dict(orientation="h", y=-0.2, x=0),
+        yaxis=dict(gridcolor="#f0f4f5", zeroline=False, range=[0, 1], tickformat=".0%",
+                   tickfont=dict(color=TEXT, size=12))))
+    return fig
+
+
+def _fig_previsao(ins):
+    """Burn-down: estoque real + projeção linear com faixa (menor/maior ritmo diário observado na janela)."""
+    f = ins["fluxo"]
+    if len(f) < MIN_DATAS_PREVISAO:
+        return None
+    j = f.tail(JANELA_PREVISAO + 1).reset_index(drop=True)
+    dias = (j["data"].diff().dt.days).iloc[1:].astype(float)
+    queda = (j["estoque"].shift(1) - j["estoque"]).iloc[1:].astype(float)
+    taxas = (queda / dias).clip(lower=0)
+    if taxas.empty or taxas.max() <= 0:
+        return None
+    ultimo, est0 = f["data"].iloc[-1], float(f["estoque"].iloc[-1])
+    medio = float(queda.sum() / dias.sum())
+    fig = go.Figure()
+    fig.add_scatter(x=f["data"], y=f["estoque"], mode="lines+markers", name="Real",
+                    line=dict(color=PRIO_HIGH, width=3), marker=dict(size=7))
+    for nome, taxa, cor, dash in (("Ritmo médio", medio, TEXT, "dash"),
+                                  ("Mais lento", float(taxas.min()), MUTED, "dot"),
+                                  ("Mais rápido", float(taxas.max()), PRIO_LOW, "dot")):
+        if taxa <= 0:
+            continue
+        n = int(est0 / taxa) + 1
+        xs = [ultimo + pd.Timedelta(days=k) for k in range(0, min(n, 365) + 1)]
+        ys = [max(est0 - taxa * k, 0) for k in range(len(xs))]
+        fig.add_scatter(x=xs, y=ys, mode="lines", name=nome, line=dict(color=cor, width=2, dash=dash))
+    fig.update_layout(**_layout_base(
+        320, showlegend=True, legend=dict(orientation="h", y=1.12, x=0),
+        xaxis=dict(type="date", showgrid=False, tickfont=dict(color=TEXT, size=12)),
+        yaxis=dict(gridcolor="#f0f4f5", zeroline=False, rangemode="tozero", tickfont=dict(color=TEXT, size=12))))
+    return fig
+
+
+def _secao_insight(titulo, chave, fig_fn, nota=None, minimo_msg=None):
+    """Renderiza uma seção com duas colunas: esquerda = todos os valores · direita = com filtros."""
+    st.markdown(f'<p class="freq-section-title" style="margin-top:1.5rem;">{titulo}</p>', unsafe_allow_html=True)
+    if nota:
+        st.markdown(f'<p style="font-size:12px;color:{MUTED};margin:-4px 0 8px;">{nota}</p>', unsafe_allow_html=True)
+    _cabecalho_lados()
+    c_esq, c_dir = st.columns(2)
+    for col, filtrar, lado in ((c_esq, False, "all"), (c_dir, True, "fil")):
+        with col:
+            ins = _carregar_insights(filtrar)
+            if not ins:
+                st.info("Histórico insuficiente: são necessárias ao menos 2 datas de referência.")
+                continue
+            fig = fig_fn(ins)
+            if fig is None:
+                st.info(minimo_msg or "Sem dados para este gráfico.")
+            else:
+                st.plotly_chart(fig, use_container_width=True, config=_CFG, key=f"ins_{chave}_{lado}")
+
+
 def render():
     st.markdown(CSS, unsafe_allow_html=True)
 
@@ -630,6 +937,31 @@ def render():
                     else:
                         st.plotly_chart(_fig_regional(dfr), use_container_width=True,
                                         config=_CFG, key=f"reg_{lado}")
+
+        # ── Insights da série histórica ───────────────────────────────────────
+        _secao_insight("fluxo diário: resolvidos × novos", "fluxo", _fig_fluxo,
+                       "Resolvidos (para baixo) e novos (para cima) em relação à data anterior; a linha é o saldo. "
+                       "Unidade: professor × turma × disciplina.")
+        _secao_insight("variação diária do estoque e alarme de base", "var", _fig_variacao,
+                       f"Cinza = base idêntica à anterior (possível falta de atualização) · vermelho = variação acima de "
+                       f"{int(LIMIAR_VARIACAO * 100)}% (conferir antes de comemorar).")
+        _secao_insight("permanência: quantos da primeira data continuam no alerta", "coorte", _fig_coorte,
+                       "Coorte = excedentes da primeira data de referência; a linha mostra quantos seguem presentes em cada data.")
+        _secao_insight("ritmo de resolução por regional", "regvar", _fig_regional_var,
+                       f"Variação entre a primeira e a última data. Vermelho = queda menor que {int(-LIMIAR_ESTAGNADA * 100)}% (estagnada).",
+                       "Sem dados de regional.")
+        _secao_insight("reincidência: resolveu e voltou", "reinc", _fig_reinc,
+                       "Excedentes presentes na data que já haviam saído do alerta em data anterior (valor e % do estoque).")
+        _secao_insight("disciplinas: variação desde a primeira data", "discvar", _fig_disc_var,
+                       "As 10 disciplinas com mais excedentes na primeira data. Vermelho = queda menor que "
+                       f"{int(-LIMIAR_ESTAGNADA * 100)}%.", "Sem dados de disciplina.")
+        _secao_insight("vínculo funcional ao longo do tempo", "vinc", _fig_vinculo,
+                       "Participação de cada situação funcional no estoque de excedentes, por data.",
+                       "Sem a coluna dc_situacao_funcional.")
+        _secao_insight("previsão de zeramento (burn-down)", "prev", _fig_previsao,
+                       f"Projeção linear com base nos últimos {JANELA_PREVISAO} intervalos; faixa = menor e maior ritmo diário observado. "
+                       "Estimativa, não meta: o ritmo tende a cair porque o que sobra é o mais difícil.",
+                       f"A previsão só aparece com pelo menos {MIN_DATAS_PREVISAO} datas de referência.")
 
     else:
         # Placeholder visual enquanto o pipeline não gerou resultados
