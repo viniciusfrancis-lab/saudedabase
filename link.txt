@@ -1,0 +1,1 @@
+python processar.py --force
