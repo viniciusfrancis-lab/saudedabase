@@ -559,9 +559,7 @@ def render():
 
 
 
-        if len(df_filtrado) > 500:
-            st.caption(f"Exibindo 500 de {fmt(len(df_filtrado))} registros. Use o CSV para ver todos.")
-
+        
     else:
         # Placeholder visual enquanto o pipeline não gerou resultados
         st.markdown(f"""
