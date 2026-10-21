@@ -172,11 +172,33 @@ def _get_logo() -> str:
 # ── Carregamento de dados ─────────────────────────────────────────────────────
 DT_COL = "dt_referencia"
 
+# ── Filtros da coluna da DIREITA (versão GitHub) ──────────────────────────────
+# A coluna da esquerda mostra todos os valores; a da direita desconsidera:
+#   - a disciplina ELETIVA(S)
+#   - num_ano_letivo == "2026/2S CEEJA/NEEJA"
+DISCIPLINAS_IGNORADAS = {"ELETIVA", "ELETIVAS"}   # comparação em MAIÚSCULAS, sem espaços nas pontas
+ANO_LETIVO_IGNORADO = "2026/2S CEEJA/NEEJA"
+
+
+def _aplicar_filtros(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove as linhas de ELETIVAS e do num_ano_letivo ignorado. Colunas ausentes não filtram nada."""
+    if df.empty:
+        return df
+    manter = pd.Series(True, index=df.index)
+    if "disciplina" in df.columns:
+        nome = df["disciplina"].astype(str).str.strip().str.upper()
+        manter &= ~nome.isin(DISCIPLINAS_IGNORADAS)
+    if "num_ano_letivo" in df.columns:
+        ano = df["num_ano_letivo"].astype(str).str.strip().str.upper()
+        manter &= ano != ANO_LETIVO_IGNORADO.upper()
+    return df[manter]
+
 
 @st.cache_data(ttl=300)
-def _ler_resumo_atual():
+def _ler_resumo_atual(filtrar: bool = False):
     """
     Lê o resumo.parquet (histórico empilhado) e devolve SÓ a dt_referencia mais recente.
+    filtrar=True aplica _aplicar_filtros (usado só na coluna da direita dos gráficos).
     Retorna (DataFrame, dt_referencia | None).
     Se o arquivo ainda está no formato antigo (sem dt_referencia, ou todas nulas),
     devolve tudo como está e dt_referencia = None.
@@ -188,14 +210,18 @@ def _ler_resumo_atual():
     df = pd.read_parquet(caminho)
     df.columns = df.columns.str.strip()
     if DT_COL not in df.columns or df.empty:
-        return df, None
+        return (_aplicar_filtros(df) if filtrar else df), None
 
+    # A data mais recente é definida na base COMPLETA, antes de filtrar.
     dts = pd.to_datetime(df[DT_COL], errors="coerce")
     ultima = dts.max()
     if pd.isna(ultima):
-        return df, None
+        return (_aplicar_filtros(df) if filtrar else df), None
 
-    return df[dts == ultima].reset_index(drop=True), ultima.date()
+    atual = df[dts == ultima]
+    if filtrar:
+        atual = _aplicar_filtros(atual)
+    return atual.reset_index(drop=True), ultima.date()
 
 
 @st.cache_data(ttl=300)
@@ -271,7 +297,7 @@ def _carregar_total_turmas():
 
 
 @st.cache_data(ttl=300)
-def _carregar_excedentes_regional():
+def _carregar_excedentes_regional(filtrar: bool = False):
     """Professores excedentes e turmas afetadas por regional (a partir do resumo.parquet)."""
     colunas = ["nm_regional", "id_turma", "eh_excedente"]
     caminho = _RESULTADOS / "resumo.parquet"
@@ -279,7 +305,7 @@ def _carregar_excedentes_regional():
     if not caminho.exists():
         return vazio
 
-    df, _ = _ler_resumo_atual()
+    df, _ = _ler_resumo_atual(filtrar)
     if df.empty or any(c not in df.columns for c in colunas):
         return vazio
 
@@ -295,10 +321,10 @@ def _carregar_excedentes_regional():
 
 
 @st.cache_data(ttl=300)
-def _carregar_professores():
+def _carregar_professores(filtrar: bool = False):
     """Um registro por professor enturmado, da dt_referencia mais recente do resumo.parquet."""
     colunas = ["id_turma", "disciplina", "cpf_docente", "eh_excedente"]
-    df, _ = _ler_resumo_atual()
+    df, _ = _ler_resumo_atual(filtrar)
     if df.empty or any(c not in df.columns for c in colunas):
         return pd.DataFrame(columns=colunas)
     if "script" in df.columns:
@@ -308,7 +334,7 @@ def _carregar_professores():
 
 # ── render() ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
-def _carregar_historico():
+def _carregar_historico(filtrar: bool = False):
     """
     Série temporal por dt_referencia (TODAS as datas do resumo.parquet, não só a mais recente):
       - excedentes = soma de eh_excedente
@@ -321,6 +347,8 @@ def _carregar_historico():
 
     df = pd.read_parquet(caminho)
     df.columns = df.columns.str.strip()
+    if filtrar:
+        df = _aplicar_filtros(df)
     if any(c not in df.columns for c in (DT_COL, "eh_excedente", "id_turma")):
         return vazio
 
@@ -335,6 +363,86 @@ def _carregar_historico():
         .sort_values(DT_COL)
         .reset_index(drop=True)
     )
+
+
+def _cabecalho_lados():
+    """Legenda das duas colunas: esquerda = todos os valores · direita = com filtros."""
+    esq, dir_ = st.columns(2)
+    estilo = f"font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:{MUTED};margin:0 0 6px;"
+    esq.markdown(f'<p style="{estilo}">Todos os valores · sem filtro</p>', unsafe_allow_html=True)
+    dir_.markdown(f'<p style="{estilo}">Com filtros · sem ELETIVAS e sem {ANO_LETIVO_IGNORADO}</p>',
+                  unsafe_allow_html=True)
+
+
+def _fig_evolucao(dfh, col_y, nome, cor):
+    xs = dfh[DT_COL].dt.strftime("%d/%m/%Y")
+    ys = dfh[col_y]
+    fig = go.Figure(go.Scatter(
+        x=xs, y=ys, mode="lines+markers+text",
+        line=dict(color=cor, width=3), marker=dict(size=9, color=cor),
+        text=[fmt(int(v)) for v in ys],
+        textposition="top center", textfont=dict(size=12, color=cor),
+        hovertemplate=f"<b>%{{x}}</b><br>%{{y:,}} {nome.lower()}<extra></extra>",
+    ))
+    ymax = float(ys.max()) if len(ys) else 0
+    fig.update_layout(
+        height=300, margin=dict(l=10, r=20, t=10, b=10),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="sans-serif", size=12, color=MUTED),
+        xaxis=dict(type="category", showgrid=False, tickfont=dict(color=TEXT, size=12)),
+        yaxis=dict(gridcolor="#f0f4f5", zeroline=False,
+                   range=[0, ymax * 1.18 if ymax > 0 else 1],
+                   tickfont=dict(color=TEXT, size=12)),
+        showlegend=False,
+    )
+    return fig
+
+
+def _fig_top10(top10):
+    fig = go.Figure(go.Bar(
+        x=top10["qtd"], y=top10["disciplina"], orientation="h",
+        marker=dict(color=PRIO_LOW, line=dict(width=0), cornerradius=4),
+        text=[fmt(int(v)) for v in top10["qtd"]],
+        textposition="outside", textfont=dict(size=12, color=TEXT),
+        hovertemplate="<b>%{y}</b><br>%{x:,} professores excedentes (enturmações)<extra></extra>",
+    ))
+    fig.update_layout(
+        height=max(140, 40 * len(top10) + 40), margin=dict(l=0, r=80, t=10, b=10),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="sans-serif", size=12, color=MUTED),
+        xaxis=dict(gridcolor="#f0f4f5", showline=False, zeroline=False,
+                   tickfont=dict(color=TEXT, size=12)),
+        yaxis=dict(autorange="reversed", showgrid=False, showline=False,
+                   tickfont=dict(color=TEXT, size=13)),
+        showlegend=False,
+    )
+    return fig
+
+
+def _fig_regional(df_reg):
+    fig = go.Figure(go.Bar(
+        x=df_reg["excedentes"], y=df_reg["regional"], orientation="h",
+        marker=dict(color=PRIO_HIGH, line=dict(width=0), cornerradius=4),
+        text=[fmt(int(v)) for v in df_reg["excedentes"]],
+        textposition="outside", textfont=dict(size=12, color=TEXT),
+        customdata=df_reg["turmas"],
+        hovertemplate="<b>%{y}</b><br>%{x:,} professores excedentes · "
+                      "%{customdata:,} turmas afetadas<extra></extra>",
+    ))
+    fig.update_layout(
+        height=max(200, 36 * len(df_reg) + 40), margin=dict(l=0, r=80, t=10, b=10),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="sans-serif", size=12, color=MUTED),
+        xaxis=dict(gridcolor="#f0f4f5", showline=False, zeroline=False,
+                   tickfont=dict(color=TEXT, size=12)),
+        yaxis=dict(autorange="reversed", showgrid=False, showline=False,
+                   tickfont=dict(color=TEXT, size=13)),
+        showlegend=False,
+    )
+    return fig
+
+
+_CFG = {"displayModeBar": False}
 
 
 def render():
@@ -437,129 +545,92 @@ def render():
         cards_html.append('</div>')
         st.markdown("".join(cards_html), unsafe_allow_html=True)
 
-        # ── Evolução por dt_referencia (linhas com ponto) ─────────────────────
+        # ── Daqui para baixo: esquerda = todos os valores · direita = com filtros ──
+        # ── Evolução por dt_referencia ─────────────────────────────────────────
         st.markdown('<p class="freq-section-title" style="margin-top:1.5rem;">evolução por data de referência</p>', unsafe_allow_html=True)
+        _cabecalho_lados()
 
-        df_hist = _carregar_historico()
-        if df_hist.empty:
+        df_hist_all = _carregar_historico()
+        df_hist_fil = _carregar_historico(True)
+        if df_hist_all.empty:
             st.info("Sem histórico disponível para o gráfico de evolução.")
         else:
-            xs = df_hist[DT_COL].dt.strftime("%d/%m/%Y")
-            # Dois gráficos independentes (um eixo Y cada): eixo duplo fazia as linhas
-            # parecerem correlacionadas só por causa da escala de cada eixo.
-            col_exc, col_tur = st.columns(2)
-            series_hist = [
-                (col_exc, "Professores excedentes", df_hist["excedentes"], PRIO_HIGH, "hist_exc"),
-                (col_tur, "Turmas com alerta",      df_hist["turmas"],     TEAL,      "hist_tur"),
-            ]
-            for col, nome, ys, cor, chave in series_hist:
-                fig_h = go.Figure(go.Scatter(
-                    x=xs, y=ys, mode="lines+markers+text",
-                    line=dict(color=cor, width=3), marker=dict(size=9, color=cor),
-                    text=[fmt(int(v)) for v in ys],
-                    textposition="top center", textfont=dict(size=12, color=cor),
-                    hovertemplate=f"<b>%{{x}}</b><br>%{{y:,}} {nome.lower()}<extra></extra>",
-                ))
-                ymax = float(ys.max()) if len(ys) else 0
-                fig_h.update_layout(
-                    height=300, margin=dict(l=10, r=20, t=10, b=10),
-                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                    font=dict(family="sans-serif", size=12, color=MUTED),
-                    xaxis=dict(type="category", showgrid=False, tickfont=dict(color=TEXT, size=12)),
-                    yaxis=dict(gridcolor="#f0f4f5", zeroline=False,
-                               range=[0, ymax * 1.18 if ymax > 0 else 1],
-                               tickfont=dict(color=TEXT, size=12)),
-                    showlegend=False,
+            for nome, col_y, cor, chave in (
+                ("Professores excedentes", "excedentes", PRIO_HIGH, "exc"),
+                ("Turmas com alerta",      "turmas",     TEAL,      "tur"),
+            ):
+                st.markdown(
+                    f'<p style="font-size:12px;font-weight:600;color:{cor};margin:8px 0 4px;">{nome}</p>',
+                    unsafe_allow_html=True,
                 )
-                with col:
-                    st.markdown(
-                        f'<p style="font-size:12px;font-weight:600;color:{cor};margin:0 0 4px;">{nome}</p>',
-                        unsafe_allow_html=True,
-                    )
-                    st.plotly_chart(fig_h, use_container_width=True,
-                                    config={"displayModeBar": False}, key=chave)
+                c_esq, c_dir = st.columns(2)
+                for col, dfh, lado in ((c_esq, df_hist_all, "all"), (c_dir, df_hist_fil, "fil")):
+                    with col:
+                        if dfh.empty:
+                            st.info("Sem dados para este filtro.")
+                        else:
+                            st.plotly_chart(_fig_evolucao(dfh, col_y, nome, cor),
+                                            use_container_width=True, config=_CFG,
+                                            key=f"hist_{chave}_{lado}")
 
         # ── Top 10 disciplinas com mais professores excedentes ────────────────
         st.markdown('<p class="freq-section-title" style="margin-top:1.5rem;">top 10 disciplinas com mais professores excedentes</p>', unsafe_allow_html=True)
+        _cabecalho_lados()
 
-        df_prof = _carregar_professores()
+        df_prof_all = _carregar_professores()
+        df_prof_fil = _carregar_professores(True)
         # Só excedentes (eh_excedente = 1)
-        df_prof = df_prof[df_prof["eh_excedente"] == 1]
+        df_prof_all = df_prof_all[df_prof_all["eh_excedente"] == 1]
+        df_prof_fil = df_prof_fil[df_prof_fil["eh_excedente"] == 1]
 
-        if df_prof.empty:
+        if df_prof_all.empty:
             st.info("Sem dados de professores excedentes disponíveis para o gráfico.")
         else:
+            # Os seletores valem para os dois lados (opções vêm da base completa).
             c1, c2 = st.columns(2)
-            sel_turma = c1.multiselect("id_turma", sorted(df_prof["id_turma"].dropna().unique()), key="top10_turma")
-            sel_disc  = c2.multiselect("disciplina", sorted(df_prof["disciplina"].dropna().unique()), key="top10_disc")
+            sel_turma = c1.multiselect("id_turma", sorted(df_prof_all["id_turma"].dropna().unique()), key="top10_turma")
+            sel_disc  = c2.multiselect("disciplina", sorted(df_prof_all["disciplina"].dropna().unique()), key="top10_disc")
 
-            if sel_turma:
-                df_prof = df_prof[df_prof["id_turma"].isin(sel_turma)]
-            if sel_disc:
-                df_prof = df_prof[df_prof["disciplina"].isin(sel_disc)]
+            c_esq, c_dir = st.columns(2)
+            for col, dfp, lado in ((c_esq, df_prof_all, "all"), (c_dir, df_prof_fil, "fil")):
+                with col:
+                    if sel_turma:
+                        dfp = dfp[dfp["id_turma"].isin(sel_turma)]
+                    if sel_disc:
+                        dfp = dfp[dfp["disciplina"].isin(sel_disc)]
 
-            # Conta enturmações excedentes (professor x turma x disciplina), não CPFs distintos:
-            # o mesmo professor excedente em várias turmas conta uma vez por turma.
-            top10 = (
-                df_prof.drop_duplicates(["id_turma", "disciplina", "cpf_docente"])
-                .groupby("disciplina").size()
-                .nlargest(10)
-                .reset_index(name="qtd")
-            )
+                    # Conta enturmações excedentes (professor x turma x disciplina), não CPFs distintos:
+                    # o mesmo professor excedente em várias turmas conta uma vez por turma.
+                    top10 = (
+                        dfp.drop_duplicates(["id_turma", "disciplina", "cpf_docente"])
+                        .groupby("disciplina").size()
+                        .nlargest(10)
+                        .reset_index(name="qtd")
+                    )
+                    if top10.empty:
+                        st.info("Nenhum professor excedente para os filtros selecionados.")
+                    else:
+                        st.plotly_chart(_fig_top10(top10), use_container_width=True,
+                                        config=_CFG, key=f"top10_{lado}")
 
-            if top10.empty:
-                st.info("Nenhum professor excedente para os filtros selecionados.")
-            else:
-                fig_bar = go.Figure(go.Bar(
-                    x=top10["qtd"], y=top10["disciplina"], orientation="h",
-                    marker=dict(color=PRIO_LOW, line=dict(width=0), cornerradius=4),
-                    text=[fmt(int(v)) for v in top10["qtd"]],
-                    textposition="outside", textfont=dict(size=12, color=TEXT),
-                    hovertemplate="<b>%{y}</b><br>%{x:,} professores excedentes (enturmações)<extra></extra>",
-                ))
-                fig_bar.update_layout(
-                    height=max(140, 40 * len(top10) + 40), margin=dict(l=0, r=80, t=10, b=10),
-                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                    font=dict(family="sans-serif", size=12, color=MUTED),
-                    xaxis=dict(gridcolor="#f0f4f5", showline=False, zeroline=False,
-                               tickfont=dict(color=TEXT, size=12)),
-                    yaxis=dict(autorange="reversed", showgrid=False, showline=False,
-                               tickfont=dict(color=TEXT, size=13)),
-                    showlegend=False,
-                )
-                st.plotly_chart(fig_bar, use_container_width=True, config={"displayModeBar": False})
-
-        # ── Gráfico: professores excedentes por regional ─────────────────────────
+        # ── Professores excedentes por regional ───────────────────────────────
         st.markdown('<p class="freq-section-title" style="margin-top:1.5rem;">professores excedentes por regional</p>', unsafe_allow_html=True)
+        _cabecalho_lados()
 
-        df_reg = _carregar_excedentes_regional()
-        if not df_reg.empty:
-            fig_reg = go.Figure(go.Bar(
-                x=df_reg["excedentes"], y=df_reg["regional"], orientation="h",
-                marker=dict(color=PRIO_HIGH, line=dict(width=0), cornerradius=4),
-                text=[fmt(int(v)) for v in df_reg["excedentes"]],
-                textposition="outside", textfont=dict(size=12, color=TEXT),
-                customdata=df_reg["turmas"],
-                hovertemplate="<b>%{y}</b><br>%{x:,} professores excedentes · "
-                              "%{customdata:,} turmas afetadas<extra></extra>",
-            ))
-            fig_reg.update_layout(
-                height=max(200, 36 * len(df_reg) + 40), margin=dict(l=0, r=80, t=10, b=10),
-                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(family="sans-serif", size=12, color=MUTED),
-                xaxis=dict(gridcolor="#f0f4f5", showline=False, zeroline=False,
-                           tickfont=dict(color=TEXT, size=12)),
-                yaxis=dict(autorange="reversed", showgrid=False, showline=False,
-                           tickfont=dict(color=TEXT, size=13)),
-                showlegend=False,
-            )
-            st.plotly_chart(fig_reg, use_container_width=True, config={"displayModeBar": False})
-        else:
+        df_reg_all = _carregar_excedentes_regional()
+        df_reg_fil = _carregar_excedentes_regional(True)
+        if df_reg_all.empty:
             st.info("Sem dados de professores excedentes por regional disponíveis para o gráfico.")
+        else:
+            c_esq, c_dir = st.columns(2)
+            for col, dfr, lado in ((c_esq, df_reg_all, "all"), (c_dir, df_reg_fil, "fil")):
+                with col:
+                    if dfr.empty:
+                        st.info("Sem dados para este filtro.")
+                    else:
+                        st.plotly_chart(_fig_regional(dfr), use_container_width=True,
+                                        config=_CFG, key=f"reg_{lado}")
 
-
-
-        
     else:
         # Placeholder visual enquanto o pipeline não gerou resultados
         st.markdown(f"""
