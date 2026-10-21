@@ -174,20 +174,20 @@ DT_COL = "dt_referencia"
 
 # ── Filtros da coluna da DIREITA (versão GitHub) ──────────────────────────────
 # A coluna da esquerda mostra todos os valores; a da direita desconsidera:
-#   - a disciplina ELETIVA(S)
+#   - qualquer disciplina cujo nome CONTENHA "ELETIV" (ELETIVA, ELETIVAS, "SMSP - ELETIVA", "ELETIVAS." ...)
 #   - num_ano_letivo == "2026/2S CEEJA/NEEJA"
-DISCIPLINAS_IGNORADAS = {"ELETIVA", "ELETIVAS"}   # comparação em MAIÚSCULAS, sem espaços nas pontas
+TERMO_DISCIPLINA_IGNORADA = "ELETIV"   # busca por trecho, sem diferenciar maiúsculas/minúsculas
 ANO_LETIVO_IGNORADO = "2026/2S CEEJA/NEEJA"
 
 
 def _aplicar_filtros(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove as linhas de ELETIVAS e do num_ano_letivo ignorado. Colunas ausentes não filtram nada."""
+    """Remove as linhas de ELETIVA (e derivações) e do num_ano_letivo ignorado. Colunas ausentes não filtram nada."""
     if df.empty:
         return df
     manter = pd.Series(True, index=df.index)
     if "disciplina" in df.columns:
         nome = df["disciplina"].astype(str).str.strip().str.upper()
-        manter &= ~nome.isin(DISCIPLINAS_IGNORADAS)
+        manter &= ~nome.str.contains(TERMO_DISCIPLINA_IGNORADA, regex=False)
     if "num_ano_letivo" in df.columns:
         ano = df["num_ano_letivo"].astype(str).str.strip().str.upper()
         manter &= ano != ANO_LETIVO_IGNORADO.upper()
@@ -370,7 +370,7 @@ def _cabecalho_lados():
     esq, dir_ = st.columns(2)
     estilo = f"font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:{MUTED};margin:0 0 6px;"
     esq.markdown(f'<p style="{estilo}">Todos os valores · sem filtro</p>', unsafe_allow_html=True)
-    dir_.markdown(f'<p style="{estilo}">Com filtros · sem ELETIVAS e sem {ANO_LETIVO_IGNORADO}</p>',
+    dir_.markdown(f'<p style="{estilo}">Com filtros · sem ELETIVA (e derivações) e sem {ANO_LETIVO_IGNORADO}</p>',
                   unsafe_allow_html=True)
 
 
